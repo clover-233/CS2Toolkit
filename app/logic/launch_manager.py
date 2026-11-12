@@ -1,31 +1,52 @@
 import ctypes
+from ctypes import wintypes
 import os
 import subprocess
 
 from .steam_utils import SteamUtils
 
 
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = [
+        ('dwSize', wintypes.DWORD), ('cntUsage', wintypes.DWORD),
+        ('th32ProcessID', wintypes.DWORD), ('th32DefaultHeapID', ctypes.c_size_t),
+        ('th32ModuleID', wintypes.DWORD), ('cntThreads', wintypes.DWORD),
+        ('th32ParentProcessID', wintypes.DWORD), ('pcPriClassBase', wintypes.LONG),
+        ('dwFlags', wintypes.DWORD), ('szExeFile', wintypes.WCHAR * 260),
+    ]
+
+
 class LaunchManager:
     @staticmethod
     def is_cs2_running():
-        try:
-            result = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq cs2.exe", "/FO", "CSV", "/NH"],
-                capture_output=True,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-            output = (result.stdout or "").strip()
-            if result.returncode == 0 and output and "INFO:" not in output.upper() and "没有运行的任务" not in output:
-                return "cs2.exe" in output.lower()
-        except Exception:
-            pass
+        return LaunchManager._is_process_running('cs2.exe')
 
-        try:
-            user32 = ctypes.windll.user32
-            return bool(user32.FindWindowW(None, "Counter-Strike 2"))
-        except Exception:
+    @staticmethod
+    def _is_process_running(executable):
+        # This is also called by the UI status timer. Spawning tasklist here
+        # blocks all queued GSI/paint events for hundreds of milliseconds.
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        for function in (kernel32.Process32FirstW, kernel32.Process32NextW):
+            function.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32W)]
+            function.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)
+        if snapshot == ctypes.c_void_p(-1).value or snapshot is None:
             return False
+        try:
+            entry = _ProcessEntry32W()
+            entry.dwSize = ctypes.sizeof(entry)
+            valid = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+            while valid:
+                if entry.szExeFile.casefold() == executable.casefold():
+                    return True
+                valid = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            return False
+        finally:
+            kernel32.CloseHandle(snapshot)
 
     @staticmethod
     def launch_cs2(cs2_path, use_vulkan=False):

@@ -561,6 +561,11 @@ class CS2Tool(FluentWindow):
             host = game_state.get("host", "127.0.0.1")
             if isinstance(port, int):
                 self.config_manager.set("gsi_port", port)
+            # Keep the game configuration aligned with the bound listener.
+            if self.gsi_manager.cs2_path:
+                cfg_ok, cfg_message = self.gsi_manager.create_gsi_cfg()
+                if not cfg_ok:
+                    self.show_warning("GSI配置未更新", cfg_message, duration=10000)
             if hasattr(self, 'home_tab'):
                 self.home_tab.status_gsi_server.setText(f"服务运行中...")
                 self.home_tab.status_gsi_server.setStyleSheet("color: green;")
@@ -604,8 +609,9 @@ class CS2Tool(FluentWindow):
                 self.home_tab.status_gsi_server.setStyleSheet("color: green;")
                 self.home_tab.update_gsi_overview()
             # This is where the event matching logic will go
-            self.integrated_sound_page.process_game_state(game_state)
+            # Render time-sensitive visuals before audio/event bookkeeping.
             self.visual_handler.process_gsi(game_state)
+            self.integrated_sound_page.process_game_state(game_state)
             self.go_pet_manager.process_gsi(game_state)
 
 

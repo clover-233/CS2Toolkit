@@ -1,7 +1,7 @@
 import threading
 
 import requests
-from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtCore import Qt, Signal, QTimer, Slot
 from PySide6.QtWidgets import QFormLayout, QVBoxLayout, QWidget
 from qfluentwidgets import (
     BodyLabel,
@@ -26,11 +26,15 @@ from ..styles import UIStyles
 
 class HomePage(ScrollArea):
     announcement_fetched = Signal(str, str)
+    game_running_checked = Signal(bool)
 
     def __init__(self, parent):
         super().__init__(parent=parent)
         self.parent_window = parent
         self.section_widgets = {}
+        self._game_running = False
+        self._process_probe_pending = False
+        self.game_running_checked.connect(self._set_game_running, Qt.QueuedConnection)
 
         self.view = QWidget(self)
         self.view.setObjectName("home_view")
@@ -48,8 +52,9 @@ class HomePage(ScrollArea):
         self._setup_ui()
         self._fetch_announcement()
         self.status_timer = QTimer(self)
-        self.status_timer.timeout.connect(self.update_status)
+        self.status_timer.timeout.connect(self._refresh_status)
         self.status_timer.start(2000)
+        QTimer.singleShot(0, self._refresh_status)
 
     def _setup_ui(self):
         self.section_widgets = {
@@ -231,6 +236,30 @@ class HomePage(ScrollArea):
         self.game_team_label.setText(str(overview.get("team", "--")))
         self.game_health_label.setText(str(overview.get("health", "--")))
 
+    def _refresh_status(self):
+        self.update_status()
+        if self._process_probe_pending:
+            return
+        self._process_probe_pending = True
+
+        def probe():
+            try:
+                running = LaunchManager.is_cs2_running()
+            except Exception:
+                running = False
+            try:
+                self.game_running_checked.emit(running)
+            except RuntimeError:
+                pass  # The page may have been destroyed while the worker ran.
+
+        threading.Thread(target=probe, daemon=True).start()
+
+    @Slot(bool)
+    def _set_game_running(self, running):
+        self._game_running = running
+        self._process_probe_pending = False
+        self.update_status()
+
     def update_status(self):
         if not self.parent_window:
             return
@@ -239,7 +268,7 @@ class HomePage(ScrollArea):
         if steam_path:
             self.steam_status_label.setText(steam_path)
             self.steam_status_label.setStyleSheet("color: green;")
-            running = LaunchManager.is_cs2_running()
+            running = self._game_running
             if running:
                 self.launch_cs2_btn.setText("关闭 CS2")
                 self.launch_card.titleLabel.setText("关闭 CS2")
