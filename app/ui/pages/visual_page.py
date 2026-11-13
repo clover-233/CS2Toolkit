@@ -84,6 +84,16 @@ class VisualConfigDialog(MessageBoxBase):
             background_hint.setWordWrap(True)
             self.viewLayout.addWidget(background_hint)
 
+            capture_layout = QHBoxLayout()
+            capture_layout.addWidget(BodyLabel("原画面捕获:"))
+            self.capture_combo = ComboBox(self)
+            self.capture_combo.addItems(["低占用（6 帧/秒）", "兼容（12 帧/秒，占用较高）"])
+            self.capture_combo.setCurrentIndex(1 if self.visual_config.get('flash_capture_mode') == 'compat' else 0)
+            self.capture_combo.currentIndexChanged.connect(self._on_capture_mode_changed)
+            capture_layout.addWidget(self.capture_combo, 1)
+            self.viewLayout.addLayout(capture_layout)
+            self.viewLayout.addWidget(BodyLabel("原画面异常时可切换兼容模式。"))
+
             reduce_layout = QHBoxLayout()
             reduce_layout.addWidget(BodyLabel("闪光弹降噪:"))
             self.flash_audio_switch = SwitchButton(self)
@@ -209,6 +219,10 @@ class VisualConfigDialog(MessageBoxBase):
 
     def _on_flash_background_changed(self, checked):
         self.visual_config['flash_freeze_background_enabled'] = checked
+        self.config_manager.set('visual', self.visual_config)
+
+    def _on_capture_mode_changed(self, index):
+        self.visual_config['flash_capture_mode'] = 'compat' if index == 1 else 'low'
         self.config_manager.set('visual', self.visual_config)
 
     def _browse_flash_dir(self):

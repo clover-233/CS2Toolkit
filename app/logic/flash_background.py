@@ -4,6 +4,7 @@ import ctypes
 from ctypes import wintypes
 import threading
 import time
+import math
 
 from PySide6.QtCore import Qt, QSize
 from PySide6.QtGui import QImage, QImageReader, QPainter
@@ -57,11 +58,12 @@ def _is_whiteout(image):
 
 class DesktopFrameSource:
     """DXGI capture owned and used exclusively by the cache worker thread."""
-    def __init__(self):
+    def __init__(self, backend='dxgi'):
         import dxcam
         from dxcam.core import Output
         from dxcam.util.io import enum_dxgi_adapters, enum_dxgi_outputs
         self.dxcam = dxcam
+        self.backend = backend
         self.cameras = {}
         self.outputs = []
         device_index = 0
@@ -89,10 +91,11 @@ class DesktopFrameSource:
             if key not in self.cameras:
                 self.cameras[key] = self.dxcam.create(
                     device_idx=device, output_idx=index, output_color='BGRA',
+                    backend=getattr(self, 'backend', 'dxgi'),
                     processor_backend='numpy', max_buffer_len=2)
             frame = self.cameras[key].grab(
                 region=(l - left, t - top, r - left, b - top),
-                copy=True, new_frame_only=False)
+                copy=False, new_frame_only=False)
             if frame is None:
                 continue
             frame[:, :, 3] = 255
@@ -117,8 +120,96 @@ class DesktopFrameSource:
         self.cameras.clear()
 
 
+class _BitmapHeader(ctypes.Structure):
+    _fields_ = [('size', wintypes.DWORD), ('width', wintypes.LONG), ('height', wintypes.LONG),
+                ('planes', wintypes.WORD), ('bits', wintypes.WORD), ('compression', wintypes.DWORD),
+                ('image_bytes', wintypes.DWORD), ('xppm', wintypes.LONG), ('yppm', wintypes.LONG),
+                ('colors', wintypes.DWORD), ('important', wintypes.DWORD)]
+
+
+class BufferedDesktopFrameSource:
+    """On-demand desktop readback with one persistent, explicitly owned DIB."""
+    def __init__(self, user32=None, gdi32=None):
+        import numpy as np
+        self.np = np
+        self.user32 = user32 or ctypes.WinDLL('user32', use_last_error=True)
+        self.gdi32 = gdi32 or ctypes.WinDLL('gdi32', use_last_error=True)
+        for function, args, result in (
+            (self.user32.GetDC, [wintypes.HWND], wintypes.HDC),
+            (self.user32.ReleaseDC, [wintypes.HWND, wintypes.HDC], ctypes.c_int),
+            (self.gdi32.CreateCompatibleDC, [wintypes.HDC], wintypes.HDC),
+            (self.gdi32.CreateDIBSection, [wintypes.HDC, ctypes.c_void_p, wintypes.UINT,
+             ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.DWORD], wintypes.HBITMAP),
+            (self.gdi32.SelectObject, [wintypes.HDC, wintypes.HANDLE], wintypes.HANDLE),
+            (self.gdi32.DeleteObject, [wintypes.HANDLE], wintypes.BOOL),
+            (self.gdi32.DeleteDC, [wintypes.HDC], wintypes.BOOL),
+            (self.gdi32.BitBlt, [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+             wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD], wintypes.BOOL),
+        ):
+            function.argtypes, function.restype = args, result
+        self.screen = self.memory = self.bitmap = self.previous = None
+        self.pixels = None
+        self.size = None
+        try:
+            self.screen = self.user32.GetDC(None)
+            if not self.screen:
+                raise OSError('无法读取桌面画面')
+            self.memory = self.gdi32.CreateCompatibleDC(self.screen)
+            if not self.memory:
+                raise OSError('无法创建截图缓冲')
+        except Exception:
+            self.close()
+            raise
+
+    def _release_bitmap(self):
+        self.pixels = None
+        if self.bitmap:
+            if self.previous:
+                self.gdi32.SelectObject(self.memory, self.previous)
+            self.gdi32.DeleteObject(self.bitmap)
+        self.bitmap = self.previous = self.size = None
+
+    def grab(self, geometry):
+        x, y, width, height = geometry
+        if width <= 0 or height <= 0:
+            return None
+        if self.size != (width, height):
+            self._release_bitmap()
+            header = _BitmapHeader(ctypes.sizeof(_BitmapHeader), width, -height, 1, 32, 0, 0, 0, 0, 0, 0)
+            pointer = ctypes.c_void_p()
+            bitmap = self.gdi32.CreateDIBSection(self.memory, ctypes.byref(header), 0,
+                                                ctypes.byref(pointer), None, 0)
+            if not bitmap or not pointer.value:
+                if bitmap:
+                    self.gdi32.DeleteObject(bitmap)
+                raise OSError('无法分配截图缓冲')
+            self.bitmap = bitmap
+            self.previous = self.gdi32.SelectObject(self.memory, bitmap)
+            if not self.previous or self.previous == ctypes.c_void_p(-1).value:
+                self.previous = None
+                self._release_bitmap()
+                raise OSError('无法使用截图缓冲')
+            self.size = (width, height)
+            array = (ctypes.c_uint32 * (width * height)).from_address(pointer.value)
+            self.pixels = self.np.ctypeslib.as_array(array).reshape(height, width)
+        if not self.gdi32.BitBlt(self.memory, 0, 0, width, height, self.screen, x, y, 0x40CC0020):
+            raise OSError('截图失败，请尝试兼容模式')
+        self.pixels |= self.np.uint32(0xff000000)
+        # The cache owns this copy; the reusable DIB never escapes the backend.
+        return QImage(self.pixels.data, width, height, width * 4, QImage.Format_ARGB32).copy()
+
+    def close(self):
+        self._release_bitmap()
+        if self.memory:
+            self.gdi32.DeleteDC(self.memory)
+            self.memory = None
+        if self.screen:
+            self.user32.ReleaseDC(None, self.screen)
+            self.screen = None
+
+
 class PreFlashCache:
-    def __init__(self, source_factory=DesktopFrameSource, fps=20, memory_limit=96 * 1024 * 1024):
+    def __init__(self, source_factory=None, fps=6, memory_limit=64 * 1024 * 1024):
         self._source_factory = source_factory
         self._interval = 1 / fps
         self._memory_limit = memory_limit
@@ -136,6 +227,17 @@ class PreFlashCache:
         self._bytes = 0
         self._error = ''
         self._capture_after = 0.0
+        self._mode = 'low'
+
+    def set_capture_mode(self, mode):
+        mode = 'compat' if mode == 'compat' else 'low'
+        with self._lock:
+            if mode == self._mode:
+                return
+            self._mode = mode
+            self._interval = 1 / (12 if mode == 'compat' else 6)
+            self._clear_locked()
+        self._wake.set()
 
     def set_enabled(self, enabled):
         with self._lock:
@@ -164,6 +266,14 @@ class PreFlashCache:
     def _store(self, image, timestamp, generation=None):
         if image is None or image.isNull() or _is_whiteout(image):
             return False
+        # Keep at least four useful historical frames at large resolutions,
+        # without letting a 4K/8K screen exhaust the ring's memory budget.
+        pixels = image.width() * image.height()
+        if pixels > 2560 * 1440:
+            ratio = math.sqrt(2560 * 1440 / pixels)
+            image = image.scaled(max(1, int(image.width() * ratio)),
+                                 max(1, int(image.height() * ratio)),
+                                 Qt.KeepAspectRatio, Qt.FastTransformation)
         with self._lock:
             if self._closed or self._suspended or (generation is not None and generation != self._generation):
                 return False
@@ -200,6 +310,7 @@ class PreFlashCache:
     def status(self):
         with self._lock:
             return {'frames': len(self._frames), 'bytes': self._bytes,
+                    'mode': self._mode, 'fps': round(1 / self._interval),
                     'frozen': self._frozen is not None, 'error': self._error,
                     'enabled': self._enabled, 'frozen_age_ms': self._frozen_age_ms,
                     'ready': bool(self._frames and time.perf_counter() - self._frames[0][0] >= 0.15)}
@@ -223,6 +334,8 @@ class PreFlashCache:
             user32 = ctypes.WinDLL('user32', use_last_error=True)
             user32.GetForegroundWindow.argtypes = []
             user32.GetForegroundWindow.restype = wintypes.HWND
+            inactive_since = None
+            source_mode = None
             while True:
                 with self._lock:
                     if self._closed:
@@ -231,13 +344,18 @@ class PreFlashCache:
                     active = self._enabled and context is not None and not self._suspended
                     generation = self._generation
                     capture_after = self._capture_after
+                    mode = self._mode
                 if not active:
-                    if not self._enabled and source is not None:
+                    if inactive_since is None:
+                        inactive_since = time.perf_counter()
+                    if source is not None and (not self._enabled or
+                            (context is None and time.perf_counter() - inactive_since >= .5)):
                         source.close()
                         source = None
                     self._wake.wait(0.1)
                     self._wake.clear()
                     continue
+                inactive_since = None
                 hwnd, geometry = context
                 if time.perf_counter() < capture_after:
                     self._wake.wait(min(self._interval, capture_after - time.perf_counter()))
@@ -249,8 +367,17 @@ class PreFlashCache:
                     continue
                 started = time.perf_counter()
                 try:
+                    if source is not None and source_mode != mode:
+                        source.close()
+                        source = None
                     if source is None:
-                        source = self._source_factory()
+                        if self._source_factory:
+                            source = self._source_factory()
+                        elif mode == 'low':
+                            source = BufferedDesktopFrameSource()
+                        else:
+                            source = DesktopFrameSource()
+                        source_mode = mode
                     image = source.grab(geometry)
                     if user32.GetForegroundWindow() == hwnd:
                         self._store(image, time.perf_counter(), generation)
