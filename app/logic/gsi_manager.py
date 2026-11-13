@@ -77,7 +77,7 @@ class GSIManager:
     "timeout" "1.0"
     "buffer"  "0.0"
     "throttle" "0.0"
-    "heartbeat" "60.0"
+    "heartbeat" "1.0"
     "auth"
     {{
         "token" "TOKEN"
@@ -180,6 +180,7 @@ class GSIManager:
             print(f"端口 {port} 已被占用，正在寻找其他可用端口...")
             available_port = self._find_available_port(host, port)
             if available_port is None:
+                self._is_starting = False
                 error_msg = f"无法找到可用端口（尝试范围：{port}-{port+9}），请检查是否有其他程序（如其他辅助软件）占用了大量端口。"
                 print(error_msg)
                 if self.data_callback:
@@ -202,6 +203,8 @@ class GSIManager:
         try:
             server_address = (host, port)
             self._httpd = ReusableHTTPServer(server_address, GSIHandler)
+            self.current_port = self._httpd.server_port
+            port = self.current_port
             # 将回调函数传递给服务器实例，以便GSIHandler可以访问它
             self._httpd.data_callback = self.data_callback
             self._is_starting = False
@@ -236,7 +239,9 @@ class GSIManager:
             return False
 
         self._is_starting = True
-        self._server_thread = threading.Thread(target=self._server_target, daemon=True)
+        self._server_thread = threading.Thread(
+            target=self._server_target,
+            args=(self.current_host, self.current_port), daemon=True)
         self._server_thread.start()
         return True
 

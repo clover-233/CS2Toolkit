@@ -128,6 +128,8 @@ def build_exe():
             "--include-qt-plugins=multimedia",
             "--include-qt-plugins=platforms",
             "--include-module=pycaw.pycaw",
+            "--include-package=dxcam",
+            "--include-package=numpy",
             "--assume-yes-for-downloads",
             "--output-dir=dist",
             f"--output-filename={output_filename}",

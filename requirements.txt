@@ -3,3 +3,5 @@ PySide6-Fluent-Widgets>=1.6,<2
 requests>=2.28,<3
 pycaw>=20230407
 zstandard
+dxcam>=0.3,<0.4
+numpy>=1.26,<3

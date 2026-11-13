@@ -5,12 +5,28 @@ import random
 import json
 import subprocess
 import threading
+import time
 from PySide6.QtWidgets import QWidget, QLabel
-from PySide6.QtCore import Qt, QUrl, QTimer, Signal, QObject, QPropertyAnimation
-from PySide6.QtGui import QPixmap, QColor, QMovie
+from PySide6.QtCore import Qt, QUrl, QTimer, Signal, QObject, QPropertyAnimation, QSize
+from PySide6.QtGui import QPixmap, QColor, QMovie, QImage
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from .audio_session_controller import AudioSessionController
+from .game_window import GameWindowTracker
+from .flash_background import (PreFlashCache, compose_flash_image,
+                               image_has_transparency, flash_image_extensions)
+
+
+class FlashSurface(QLabel):
+    """A dedicated raster window, independent of native video surfaces/effects."""
+    def __init__(self, flags):
+        super().__init__(None, flags | Qt.WindowDoesNotAcceptFocus)
+        self.setWindowTitle('CS2Toolkit Flash Surface')
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setAlignment(Qt.AlignCenter)
+        self.setWindowOpacity(0.0)
+
 
 class VisualSignals(QObject):
     update_flash = Signal(int)
@@ -30,8 +46,23 @@ class OverlayWindow(QWidget):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.game_window = GameWindowTracker()
+        self._game_focused = False
+        self._capture_scene_active = False
+        self._last_game_geometry = None
+        self._preview_active = False
+        self.background_cache = PreFlashCache()
+        self.flash_freeze_background_enabled = True
+        self._capture_allowed = False
+        self._flash_has_alpha = False
+        self._flash_active = False
+        self._frozen_background = None
+        self._flash_render_key = None
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self._finish_flash_preview)
 
-        self.flash_label = QLabel(self)
+        self.flash_label = FlashSurface(self.windowFlags())
         self.flash_label.setAlignment(Qt.AlignCenter)
         # 不隐藏 flash_label，只通过透明度控制
 
@@ -73,13 +104,14 @@ class OverlayWindow(QWidget):
         self._flash_folder_files = []
         self._flash_cached_source = ""
         self._flash_cached_pixmap = QPixmap()
+        self._flash_display_pixmap = QPixmap()
         self.death_media_path = ""
         self.death_scale_mode = "stretch"
 
         # 淡出动画相关
         self.fade_timer = QTimer(self)
         self.fade_timer.timeout.connect(self._fade_out_step)
-        self.current_opacity = 1.0
+        self.current_opacity = 0.0
 
         # 击杀图标定时隐藏
         self.kill_icon_timer = QTimer(self)
@@ -90,7 +122,9 @@ class OverlayWindow(QWidget):
         self.kill_icon_opacity_effect = QGraphicsOpacityEffect()
         self.kill_video_opacity_effect = QGraphicsOpacityEffect()
 
-        self.flash_label.setGraphicsEffect(self.flash_opacity_effect)
+        # Native window alpha avoids the first-use offscreen graphics-effect
+        # render path shared with QVideoWidget on the main overlay.
+        self.flash_opacity_effect.opacityChanged.connect(self._sync_flash_visibility)
         self.kill_icon_label.setGraphicsEffect(self.kill_icon_opacity_effect)
         self.kill_video_widget.setGraphicsEffect(self.kill_video_opacity_effect)
 
@@ -128,7 +162,7 @@ class OverlayWindow(QWidget):
         # 定期更新窗口几何信息，避免在闪光触发瞬间调用 Windows API
         self.geometry_timer = QTimer(self)
         self.geometry_timer.timeout.connect(self._update_geometry_to_game)
-        self.geometry_timer.start(2000)
+        self.geometry_timer.start(500)
         self._update_geometry_to_game()
 
         # 高频监控游戏焦点，只有在 CS2 是前台窗口时才显示覆盖层
@@ -137,48 +171,56 @@ class OverlayWindow(QWidget):
         self.focus_timer.start(100)
 
     def _check_game_focus(self):
-        user32 = ctypes.windll.user32
-        cs2_hwnd = user32.FindWindowW(None, "Counter-Strike 2")
-        fg_hwnd = user32.GetForegroundWindow()
+        focused = bool(self.game_window.foreground_game())
+        if focused and not self._game_focused:
+            self._update_geometry_to_game()
+            self.game_window.place_overlay(self.winId())
+        self._game_focused = focused
+        hwnd = self.game_window.hwnd if focused else None
+        geometry = self.game_window.client_geometry(hwnd) if hwnd else None
+        self.background_cache.set_context(hwnd, geometry, focused and self._capture_scene_active)
+        self._sync_flash_visibility()
+        self._sync_media_visibility()
 
-        if not cs2_hwnd or cs2_hwnd != fg_hwnd:
-            if self.windowOpacity() > 0.0:
-                self.setWindowOpacity(0.0)
-        else:
-            if self.windowOpacity() < 1.0:
-                self.setWindowOpacity(1.0)
+    def _sync_media_visibility(self):
+        has_content = any(not widget.isHidden() for widget in (
+            self.death_label, self.video_widget, self.kill_icon_label, self.kill_video_widget))
+        opacity = 1.0 if has_content and (self._game_focused or self._preview_active) else 0.0
+        if self.windowOpacity() != opacity:
+            self.setWindowOpacity(opacity)
 
     def _update_geometry_to_game(self):
-        user32 = ctypes.windll.user32
-        hwnd = user32.FindWindowW(None, "Counter-Strike 2")
-        if hwnd:
-            from ctypes import wintypes
-            rect = wintypes.RECT()
-            user32.GetClientRect(hwnd, ctypes.byref(rect))
+        if not self._preview_active:
+            geometry = self.game_window.client_geometry(self.game_window.find())
+            if geometry and geometry != self._last_game_geometry:
+                self.game_window.place_overlay(self.winId(), geometry)
+                self.game_window.place_overlay(self.flash_label.winId(), geometry)
+                self._last_game_geometry = geometry
+        self._layout_media()
 
-            pt = wintypes.POINT(0, 0)
-            user32.ClientToScreen(hwnd, ctypes.byref(pt))
+    def _sync_flash_visibility(self, *_):
+        opacity = (self.flash_opacity_effect.opacity()
+                   if self._game_focused or self._preview_active else 0.0)
+        if abs(self.flash_label.windowOpacity() - opacity) > 0.001:
+            self.flash_label.setWindowOpacity(opacity)
 
-            width = rect.right - rect.left
-            height = rect.bottom - rect.top
+    def closeEvent(self, event):
+        self.background_cache.close()
+        self.flash_label.close()
+        super().closeEvent(event)
 
-            # 如果获取到的窗口大小有效，则设置为游戏窗口大小
-            if width > 0 and height > 0:
-                self.setGeometry(pt.x, pt.y, width, height)
-            else:
-                screen = self.screen().geometry()
-                self.setGeometry(screen)
-        else:
-            screen = self.screen().geometry()
-            self.setGeometry(screen)
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, 'flash_label') and hasattr(self, 'flash_scale_mode'):
+            self._layout_media()
 
-        self.flash_label.setGeometry(self.rect())
+    def _layout_media(self):
         self.death_label.setGeometry(self.rect())
         self.video_widget.setGeometry(self.rect())
 
         # 重新应用缩放模式，因为窗口大小变了
         if not self.flash_label.isHidden():
-            self._update_label_pixmap(self.flash_label, self.flash_image_path, self.flash_scale_mode)
+            self._render_flash_artwork()
         if not self.death_label.isHidden() and not self.death_media_path.lower().endswith(('.mp4', '.webm', '.avi')):
             self._update_label_pixmap(self.death_label, self.death_media_path, self.death_scale_mode)
 
@@ -203,9 +245,8 @@ class OverlayWindow(QWidget):
         self._flash_folder_files = []
         self._flash_cached_source = ""
         self._flash_cached_pixmap = QPixmap()
-
         if path and os.path.isdir(path):
-            valid_exts = {'.png', '.jpg', '.jpeg', '.bmp'}
+            valid_exts = flash_image_extensions()
             self._flash_folder_files = [
                 os.path.join(path, f)
                 for f in os.listdir(path)
@@ -252,6 +293,7 @@ class OverlayWindow(QWidget):
 
     def _set_label_pixmap_from_pixmap(self, label, pixmap, scale_mode):
         if pixmap.isNull():
+            label.clear()
             return
 
         if scale_mode == 'stretch':
@@ -283,24 +325,113 @@ class OverlayWindow(QWidget):
         # 提前准备好闪光图片，但不显示
         self.flash_label.setStyleSheet("background: transparent;")
         _, pixmap = self._prepare_flash_pixmap()
-        self._set_label_pixmap_from_pixmap(self.flash_label, pixmap, self.flash_scale_mode)
+        self._flash_display_pixmap = pixmap
+        self._flash_has_alpha = image_has_transparency(pixmap.toImage())
+        self._flash_render_key = None
+        self._refresh_background_capture()
+        self._render_flash_artwork()
+
+    def set_flash_background_enabled(self, enabled, capture_allowed=True):
+        self.flash_freeze_background_enabled = bool(enabled)
+        self._capture_allowed = bool(capture_allowed)
+        self._refresh_background_capture()
+        self._flash_render_key = None
+        self._render_flash_artwork()
+
+    def _refresh_background_capture(self):
+        enabled = (self.flash_freeze_background_enabled and self._flash_has_alpha
+                   and self._capture_allowed)
+        self.background_cache.set_enabled(enabled)
+        if not enabled:
+            self._frozen_background = None
+            self.background_cache.resume()
+        elif self._flash_active:
+            snapshot = self.background_cache.freeze()
+            if not self._preview_active and self._frozen_background is None:
+                self._frozen_background = snapshot
+
+    def _render_flash_artwork(self):
+        artwork = self._flash_display_pixmap
+        background_key = (self._frozen_background.cacheKey()
+                          if self._frozen_background is not None else None)
+        compose = self._flash_active and self.flash_freeze_background_enabled and self._flash_has_alpha
+        ratio = self.flash_label.devicePixelRatioF()
+        size = QSize(max(1, round(self.flash_label.width() * ratio)),
+                     max(1, round(self.flash_label.height() * ratio)))
+        key = (artwork.cacheKey(), background_key, compose, size.width(), size.height(), self.flash_scale_mode)
+        if key == self._flash_render_key:
+            return
+        self._flash_render_key = key
+        if compose:
+            frame = compose_flash_image(artwork.toImage(), self._frozen_background, size, self.flash_scale_mode)
+            pixmap = QPixmap.fromImage(frame)
+            pixmap.setDevicePixelRatio(ratio)
+            self.flash_label.setScaledContents(True)
+            self.flash_label.setPixmap(pixmap)
+        else:
+            self._set_label_pixmap_from_pixmap(self.flash_label, artwork, self.flash_scale_mode)
+
+    def preview_flash(self):
+        self._preload_flash_if_needed()
+        if self._flash_display_pixmap.isNull():
+            return False
+        if self.flash_freeze_background_enabled and self._flash_has_alpha:
+            if not self._preview_active:
+                self._frozen_background = self.screen().grabWindow(0).toImage()
+            self.background_cache.freeze()
+        self._preview_active = True
+        self._last_game_geometry = None
+        self.setGeometry(self.screen().geometry())
+        self.flash_label.setGeometry(self.geometry())
+        self._layout_media()
+        self.setWindowOpacity(1.0)
+        self.game_window.place_overlay(self.winId())
+        self.update_flash(1)
+        self.preview_timer.start(2500)
+        return True
+
+    def _finish_flash_preview(self):
+        self._preview_active = False
+        self.fade_timer.stop()
+        self.current_opacity = 0.0
+        self._flash_active = False
+        self.flash_opacity_effect.setOpacity(0.0)
+        self._frozen_background = None
+        self.background_cache.resume()
+        self._preload_flash_if_needed()
+        self._update_geometry_to_game()
+        self._check_game_focus()
 
     def update_flash(self, flash_value):
         if not self.flash_image_path or not os.path.exists(self.flash_image_path):
             self.fade_timer.stop()
             self.current_opacity = 0.0
+            self._flash_active = False
+            self._frozen_background = None
+            self.background_cache.resume()
             self.flash_opacity_effect.setOpacity(0.0)
             self.flash_label.setPixmap(QPixmap())
             self._check_hide()
             return
 
         if flash_value > 0:
+            if not self._flash_active:
+                if self.flash_freeze_background_enabled and self._flash_has_alpha and not self._preview_active:
+                    self._frozen_background = self.background_cache.freeze()
+                self._flash_active = True
+            self._render_flash_artwork()
             # 几何信息已由 geometry_timer 定期更新，无需在此处调用
 
             # 只要 flashed 为 1，透明度直接设为 1 (100% 显示)
             self.fade_timer.stop()
             self.current_opacity = 1.0
             self.flash_opacity_effect.setOpacity(1.0)
+            self.flash_label.raise_()
+            self._check_game_focus()
+            if self._game_focused or self._preview_active:
+                self.game_window.place_overlay(self.flash_label.winId())
+                # Flush the first raster frame before any audio worker starts.
+                self.flash_label.repaint()
         else:
             # 当 flashed 变为 0 时，如果图片正在显示，则启动淡出动画
             if self.current_opacity > 0 and not self.fade_timer.isActive():
@@ -310,6 +441,9 @@ class OverlayWindow(QWidget):
         self.current_opacity -= 0.05  # 每次减少 0.05，约 1 秒淡出
         if self.current_opacity <= 0:
             self.current_opacity = 0
+            self._flash_active = False
+            self._frozen_background = None
+            self.background_cache.resume()
             self.fade_timer.stop()
             self.flash_opacity_effect.setOpacity(0.0)
             self.flash_label.setPixmap(QPixmap()) # 释放闪光图内存
@@ -340,6 +474,7 @@ class OverlayWindow(QWidget):
         else:
             self._update_label_pixmap(self.death_label, self.death_media_path, self.death_scale_mode)
             self.death_label.show()
+        self._sync_media_visibility()
 
     def hide_death(self):
         self.death_label.hide()
@@ -398,6 +533,7 @@ class OverlayWindow(QWidget):
 
         # 显示3秒后触发淡出
         self.kill_icon_timer.start(3000)
+        self._sync_media_visibility()
 
     def hide_kill_icon(self):
         self.kill_icon_timer.stop()
@@ -421,7 +557,7 @@ class OverlayWindow(QWidget):
         self._check_hide()
 
     def _check_hide(self):
-        pass # 我们现在保持窗口常驻以消除延迟，所以不再隐藏窗口
+        self._sync_media_visibility()
 
 
 
@@ -433,6 +569,7 @@ class VisualHandler(QObject):
 
         self.overlay = OverlayWindow()
         self.signals.update_flash.connect(self.overlay.update_flash)
+        self.overlay.preview_timer.timeout.connect(self._restore_flash_after_preview)
         self.signals.show_death.connect(self.overlay.show_death)
         self.signals.hide_death.connect(self.overlay.hide_death)
         self.signals.show_kill_icon.connect(self.overlay.show_kill_icon)
@@ -456,8 +593,20 @@ class VisualHandler(QObject):
         self._round_start_kills = 0
         self._visual_config_signature = None
         self._flash_volume_reduced = False
+        self.last_gsi_time = None
+        self.last_flash_value = None
+        self.last_is_observing = False
+        self.last_flash_trigger_time = None
+
+        self.config_timer = QTimer(self)
+        self.config_timer.timeout.connect(self._update_config)
+        self.config_timer.start(300)
 
         self._update_config(force=True)
+
+    def _restore_flash_after_preview(self):
+        if self.is_flashed:
+            self.overlay.update_flash(1)
 
     def _update_config(self, force=False):
         config = self.config_manager.get('visual', {})
@@ -472,10 +621,16 @@ class VisualHandler(QObject):
         self.flash_scale_mode = config.get('flash_scale_mode', 'stretch')
         self.flash_reduce_volume_enabled = config.get('flash_reduce_volume_enabled', False)
         self.flash_reduce_volume_percent = config.get('flash_reduce_volume_percent', 25)
+        if not (self.visual_master_enabled and self.flash_enabled and self.flash_reduce_volume_enabled):
+            self._restore_flash_audio_reduction()
         self.overlay.set_flash_image(
             self.flash_path,
             self.flash_scale_mode
         )
+        self.overlay.set_flash_background_enabled(
+            config.get('flash_freeze_background_enabled', True),
+            self.visual_master_enabled and self.flash_enabled)
+        self.overlay.background_cache.set_capture_mode(config.get('flash_capture_mode', 'low'))
 
         self.death_media_enabled = config.get('death_media_enabled', False)
         self.death_media_path = config.get('death_media_path', '')
@@ -494,11 +649,18 @@ class VisualHandler(QObject):
         self.overlay.kill_icon_width = config.get('kill_icon_width', 120)
         self.overlay.kill_icon_height = config.get('kill_icon_height', 120)
         self.overlay.kill_icon_bottom = config.get('kill_icon_bottom', 100)
+        if (not self.visual_master_enabled or not self.flash_enabled) and self.is_flashed:
+            self.is_flashed = False
+            self.signals.update_flash.emit(0)
+            self._restore_flash_audio_reduction()
 
     def process_gsi(self, game_state: dict):
         self._update_config()
+        self.last_gsi_time = time.monotonic()
+        self.last_flash_value = game_state.get('player', {}).get('state', {}).get('flashed')
 
         if not self.visual_master_enabled:
+            self.overlay._capture_scene_active = False
             if self.is_flashed:
                 self.is_flashed = False
                 self.signals.update_flash.emit(0)
@@ -511,6 +673,11 @@ class VisualHandler(QObject):
 
         player = game_state.get('player', {})
         if not player:
+            self.overlay._capture_scene_active = False
+            if self.is_flashed:
+                self.is_flashed = False
+                self.signals.update_flash.emit(0)
+                self._restore_flash_audio_reduction()
             return
 
         state = player.get('state', {})
@@ -528,14 +695,19 @@ class VisualHandler(QObject):
         is_observing = False
         if provider_steamid and player_steamid and provider_steamid != player_steamid:
             is_observing = True
-        elif spectarget is not None or activity == 'spectating' or not has_valid_team:
+        elif (spectarget not in (None, 0, '0', -1, '-1', '')
+              or activity == 'spectating' or not has_valid_team):
             is_observing = True
+        self.last_is_observing = is_observing
 
         # 1. 闪光弹处理
+        self.overlay._capture_scene_active = not is_observing and health > 0 and activity == 'playing'
         if self.flash_enabled and not is_observing:
             flash_active = state.get('flashed', 0) > 0
             if flash_active != self.is_flashed:
                 self.is_flashed = flash_active
+                if flash_active:
+                    self.last_flash_trigger_time = time.monotonic()
                 self.signals.update_flash.emit(1 if flash_active else 0)
                 if flash_active:
                     self._apply_flash_audio_reduction()
@@ -614,6 +786,34 @@ class VisualHandler(QObject):
 
         self._last_phase = phase
 
+    def flash_status(self):
+        self._update_config()
+        if not self.visual_master_enabled:
+            return "视觉总开关已关闭"
+        if not self.flash_enabled:
+            return "闪光替换已关闭"
+        if self.overlay._flash_display_pixmap.isNull():
+            return "图片无法读取，请重新选择 PNG/JPG/BMP 图片"
+        suffix = ''
+        if self.overlay.flash_freeze_background_enabled and self.overlay._flash_has_alpha:
+            cache = self.overlay.background_cache.status()
+            if self.overlay._flash_active:
+                suffix = '；背景：闪光前静止画面' if self.overlay._frozen_background is not None else '；背景尚未就绪，本次使用深色底'
+            elif cache['error']:
+                suffix = '；原画面捕获暂不可用'
+            else:
+                suffix = '；原画面缓存就绪' if cache['ready'] else '；原画面缓存中，请切回游戏稍候'
+        if self.last_gsi_time is None:
+            return "图片就绪，等待游戏数据；请进入地图，配置变更后需重启 CS2" + suffix
+        age = int(time.monotonic() - self.last_gsi_time)
+        value = self.last_flash_value
+        event = f"闪光值 {value}" if value is not None else "本次数据没有闪光字段"
+        observing = "，当前判定为观战" if self.last_is_observing else ""
+        focus = "，CS2 在前台" if self.overlay._game_focused else "，CS2 不在前台"
+        triggered = (f"；{int(time.monotonic() - self.last_flash_trigger_time)} 秒前触发过替换"
+                     if self.last_flash_trigger_time is not None else "；尚未触发替换")
+        return f"{age} 秒前收到游戏数据，{event}{observing}{focus}{triggered}{suffix}"
+
     def _should_restore_boss_key(self, phase, health, is_observing):
         if not (self._boss_key_triggered or self._boss_key_restore_pending or self._browser_muted):
             return False
@@ -652,37 +852,13 @@ class VisualHandler(QObject):
         if not self.flash_reduce_volume_enabled or self._flash_volume_reduced:
             return
         self._flash_volume_reduced = True
-
-        def _task():
-            import comtypes
-            comtypes.CoInitialize()
-            try:
-                ok, msg = self.audio_session_controller.reduce_process_volume(["cs2.exe"], self.flash_reduce_volume_percent)
-                print(f"Reduce volume result: {ok}, {msg}")
-            except Exception as e:
-                print(f"Error in reduce volume task: {e}")
-            finally:
-                comtypes.CoUninitialize()
-
-        threading.Thread(target=_task, daemon=True).start()
+        self.audio_session_controller.request_reduction(["cs2.exe"], self.flash_reduce_volume_percent)
 
     def _restore_flash_audio_reduction(self):
         if not self._flash_volume_reduced:
             return
         self._flash_volume_reduced = False
-
-        def _task():
-            import comtypes
-            comtypes.CoInitialize()
-            try:
-                ok, msg = self.audio_session_controller.restore_volume()
-                print(f"Restore volume result: {ok}, {msg}")
-            except Exception as e:
-                print(f"Error in restore volume task: {e}")
-            finally:
-                comtypes.CoUninitialize()
-
-        threading.Thread(target=_task, daemon=True).start()
+        self.audio_session_controller.request_reduction()
 
     def _minimize_cs2(self):
         user32 = ctypes.windll.user32
@@ -1040,4 +1216,11 @@ class VisualHandler(QObject):
                 subprocess.run(["taskkill", "/F", "/IM", b], capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW)
 
     def cleanup(self):
+        self.config_timer.stop()
+        self.overlay.preview_timer.stop()
+        self.overlay.geometry_timer.stop()
+        self.overlay.focus_timer.stop()
+        self.overlay.fade_timer.stop()
+        self.overlay.close()
         self._restore_flash_audio_reduction()
+        self.audio_session_controller.close()

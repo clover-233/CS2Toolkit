@@ -1,8 +1,9 @@
 import os
+from ...logic.flash_background import flash_image_extensions
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QFileDialog, QColorDialog
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from qfluentwidgets import (ScrollArea, SettingCardGroup, SwitchSettingCard, SettingCard,
-                           PushSettingCard, PushButton, FluentIcon as FIF, LineEdit, MessageBoxBase, SubtitleLabel, BodyLabel, SwitchButton, Slider)
+                           PushSettingCard, PushButton, FluentIcon as FIF, LineEdit, MessageBoxBase, SubtitleLabel, BodyLabel, SwitchButton, Slider, InfoBar)
 
 class VisualSettingCard(SettingCard):
     def __init__(self, icon, title, content=None, parent=None):
@@ -68,6 +69,30 @@ class VisualConfigDialog(MessageBoxBase):
             self.scale_combo.currentIndexChanged.connect(self._on_flash_scale_changed)
             scale_layout.addWidget(self.scale_combo, 1)
             self.viewLayout.addLayout(scale_layout)
+
+            background_layout = QHBoxLayout()
+            background_layout.addWidget(BodyLabel("半透明图片显示原画面:"))
+            self.flash_background_switch = SwitchButton(self)
+            self.flash_background_switch.setOnText("开")
+            self.flash_background_switch.setOffText("关")
+            self.flash_background_switch.setChecked(self.visual_config.get('flash_freeze_background_enabled', True))
+            self.flash_background_switch.checkedChanged.connect(self._on_flash_background_changed)
+            background_layout.addStretch()
+            background_layout.addWidget(self.flash_background_switch)
+            self.viewLayout.addLayout(background_layout)
+            background_hint = BodyLabel("开启：透明区域显示闪光前的静止画面；关闭：普通透明叠加。")
+            background_hint.setWordWrap(True)
+            self.viewLayout.addWidget(background_hint)
+
+            capture_layout = QHBoxLayout()
+            capture_layout.addWidget(BodyLabel("原画面捕获:"))
+            self.capture_combo = ComboBox(self)
+            self.capture_combo.addItems(["低占用（6 帧/秒）", "兼容（12 帧/秒，占用较高）"])
+            self.capture_combo.setCurrentIndex(1 if self.visual_config.get('flash_capture_mode') == 'compat' else 0)
+            self.capture_combo.currentIndexChanged.connect(self._on_capture_mode_changed)
+            capture_layout.addWidget(self.capture_combo, 1)
+            self.viewLayout.addLayout(capture_layout)
+            self.viewLayout.addWidget(BodyLabel("原画面异常时可切换兼容模式。"))
 
             reduce_layout = QHBoxLayout()
             reduce_layout.addWidget(BodyLabel("闪光弹降噪:"))
@@ -185,11 +210,20 @@ class VisualConfigDialog(MessageBoxBase):
         self.widget.setMinimumWidth(400)
 
     def _browse_flash_image(self):
-        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", "图片文件 (*.png *.jpg *.jpeg *.bmp)")
+        extensions = ' '.join('*' + ext for ext in sorted(flash_image_extensions()))
+        path, _ = QFileDialog.getOpenFileName(self, "选择图片", "", f"图片文件 ({extensions})")
         if path:
             self.visual_config['flash_path'] = path
             self.path_label.setText(os.path.basename(path))
             self.config_manager.set('visual', self.visual_config)
+
+    def _on_flash_background_changed(self, checked):
+        self.visual_config['flash_freeze_background_enabled'] = checked
+        self.config_manager.set('visual', self.visual_config)
+
+    def _on_capture_mode_changed(self, index):
+        self.visual_config['flash_capture_mode'] = 'compat' if index == 1 else 'low'
+        self.config_manager.set('visual', self.visual_config)
 
     def _browse_flash_dir(self):
         path = QFileDialog.getExistingDirectory(self, "选择图片文件夹")
@@ -469,6 +503,7 @@ class VisualPage(ScrollArea):
             'flash_enabled': False,
             'flash_path': '',
             'flash_scale_mode': 'stretch',
+            'flash_freeze_background_enabled': True,
             'flash_reduce_volume_enabled': False,
             'flash_reduce_volume_percent': 25,
             'death_media_enabled': False,
@@ -529,6 +564,14 @@ class VisualPage(ScrollArea):
         self.flash_card.setting_btn.clicked.connect(lambda: self._open_settings('flash'))
         self.practical_group.addSettingCard(self.flash_card)
 
+        self.flash_test_card = PushSettingCard(
+            text="预览闪光（2.5 秒）", icon=FIF.PHOTO,
+            title="测试图片显示", content="先在桌面预览，再进入游戏检查闪光联动",
+            parent=self.practical_group)
+        self.flash_test_card.clicked.connect(self._preview_flash)
+        self.practical_group.addSettingCard(self.flash_test_card)
+
+
         self.fullscreen_support_card = SwitchSettingCard(
             icon=FIF.GAME,
             title="全屏支持（Vulkan）",
@@ -552,6 +595,14 @@ class VisualPage(ScrollArea):
         self.practical_group.addSettingCard(self.kill_icon_card)
 
         self.layout.addWidget(self.practical_group)
+
+        self.flash_status_label = BodyLabel(self.view)
+        self.flash_status_label.setWordWrap(True)
+        self.layout.addWidget(self.flash_status_label)
+        self.status_timer = QTimer(self)
+        self.status_timer.timeout.connect(self._refresh_flash_status)
+        self.status_timer.start(500)
+        self._refresh_flash_status()
 
         self.entertainment_group = SettingCardGroup("娱乐功能", self.view)
 
@@ -587,6 +638,19 @@ class VisualPage(ScrollArea):
         else:
             dialog = VisualConfigDialog(self.config_manager, type, self)
         dialog.exec()
+
+    def _refresh_flash_status(self):
+        handler = getattr(self.parent_window, 'visual_handler', None)
+        if handler:
+            self.flash_status_label.setText(handler.flash_status())
+
+    def _preview_flash(self):
+        handler = getattr(self.parent_window, 'visual_handler', None)
+        if not handler:
+            return
+        handler._update_config(force=True)
+        if not handler.overlay.preview_flash():
+            InfoBar.warning("无法预览", "请先在闪光设置中选择可读取的图片或图片文件夹。", parent=self)
 
     def _on_flash_switch_changed(self, is_checked):
         self.visual_config['flash_enabled'] = is_checked
