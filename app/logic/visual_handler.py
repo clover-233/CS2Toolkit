@@ -472,6 +472,8 @@ class VisualHandler(QObject):
         self.flash_scale_mode = config.get('flash_scale_mode', 'stretch')
         self.flash_reduce_volume_enabled = config.get('flash_reduce_volume_enabled', False)
         self.flash_reduce_volume_percent = config.get('flash_reduce_volume_percent', 25)
+        if not (self.visual_master_enabled and self.flash_enabled and self.flash_reduce_volume_enabled):
+            self._restore_flash_audio_reduction()
         self.overlay.set_flash_image(
             self.flash_path,
             self.flash_scale_mode
@@ -652,37 +654,13 @@ class VisualHandler(QObject):
         if not self.flash_reduce_volume_enabled or self._flash_volume_reduced:
             return
         self._flash_volume_reduced = True
-
-        def _task():
-            import comtypes
-            comtypes.CoInitialize()
-            try:
-                ok, msg = self.audio_session_controller.reduce_process_volume(["cs2.exe"], self.flash_reduce_volume_percent)
-                print(f"Reduce volume result: {ok}, {msg}")
-            except Exception as e:
-                print(f"Error in reduce volume task: {e}")
-            finally:
-                comtypes.CoUninitialize()
-
-        threading.Thread(target=_task, daemon=True).start()
+        self.audio_session_controller.request_reduction(["cs2.exe"], self.flash_reduce_volume_percent)
 
     def _restore_flash_audio_reduction(self):
         if not self._flash_volume_reduced:
             return
         self._flash_volume_reduced = False
-
-        def _task():
-            import comtypes
-            comtypes.CoInitialize()
-            try:
-                ok, msg = self.audio_session_controller.restore_volume()
-                print(f"Restore volume result: {ok}, {msg}")
-            except Exception as e:
-                print(f"Error in restore volume task: {e}")
-            finally:
-                comtypes.CoUninitialize()
-
-        threading.Thread(target=_task, daemon=True).start()
+        self.audio_session_controller.request_reduction()
 
     def _minimize_cs2(self):
         user32 = ctypes.windll.user32
@@ -1041,3 +1019,4 @@ class VisualHandler(QObject):
 
     def cleanup(self):
         self._restore_flash_audio_reduction()
+        self.audio_session_controller.close()
